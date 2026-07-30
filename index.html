@@ -49,6 +49,8 @@
 window.CROCUS_CONFIG = {
   endpoint: "https://crocus-ai.zhcg2b4hg4.workers.dev/ai",
   model: "claude-sonnet-4-6",
+  /* папка с роликами схем движения — рядом с index.html */
+  videoBase: "video/",
 };
 </script>
 <script>
@@ -1818,6 +1820,23 @@ function GlobalStyle() {
       @keyframes pLegcurl { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(85deg); } }
       .ch-anim-legcurl .ch-p-shin-l, .ch-anim-legcurl .ch-p-shin-r { animation: pLegcurl 1.4s ease-in-out infinite; transform-origin: top center; }
 
+      .ch-pic-legend {
+        position: absolute; left: 8px; bottom: 8px; z-index: 2;
+        display: flex; align-items: center; gap: 5px;
+        font-size: 9.5px; font-weight: 600;
+        background: rgba(8,6,14,0.62); color: #e8e4f2; padding: 3px 8px 3px 6px;
+        border-radius: 20px; backdrop-filter: blur(3px); max-width: 72%;
+        overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+      }
+      .ch-pic-legend i {
+        width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+        background: #ff3b5c; box-shadow: 0 0 6px 1px rgba(255,23,68,0.75);
+        animation: chMusPulse 2.4s ease-in-out infinite;
+      }
+      @keyframes chMusPulse {
+        0%, 100% { opacity: 0.45; transform: scale(0.85); }
+        50% { opacity: 1; transform: scale(1.15); }
+      }
       .ch-gif-badge {
         position: absolute; top: 8px; right: 8px; font-size: 9.5px; font-weight: 700; letter-spacing: 0.5px;
         background: rgba(10,13,10,0.55); color: #fff; padding: 3px 7px; border-radius: 6px; backdrop-filter: blur(2px);
@@ -2981,7 +3000,7 @@ function Bone({ from, to, a, b, color, dur, width = 5 }) {
   );
 }
 
-function ExercisePictogram({ type, color }) {
+function ExerciseScheme({ type, color }) {
   const pose = POSES[type] || POSES.bwsquat;
   const { a, b, dur, gear } = pose;
   const spline = { calcMode: "spline", keySplines: "0.4 0 0.6 1;0.4 0 0.6 1", keyTimes: "0;0.5;1", repeatCount: "indefinite", dur: `${dur}s` };
@@ -2991,9 +3010,62 @@ function ExercisePictogram({ type, color }) {
   );
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   СХЕМА ДВИЖЕНИЯ — видеоролик с анатомической анимацией.
+   Файлы лежат рядом с приложением в папке video/ (см. CROCUS_CONFIG).
+   Если ролик не подгрузился, показываем рисованную схему как раньше.
+   ═══════════════════════════════════════════════════════════════════ */
+function ExercisePictogram({ type, color, muscle }) {
+  /* try 0 — папка video/, try 1 — рядом с index.html, дальше рисованная схема */
+  const [attempt, setAttempt] = useState(0);
+  const vref = useRef(null);
+  const cfg = (window.CROCUS_CONFIG && window.CROCUS_CONFIG.videoBase);
+  const paths = [cfg == null ? "video/" : cfg, ""];
+  const failed = attempt >= paths.length;
+  const base = failed ? "" : paths[attempt];
+
+  /* играем только то, что видно на экране — иначе телефон задыхается
+     от пяти одновременно декодируемых роликов */
+  useEffect(() => {
+    if (failed) return;
+    const v = vref.current;
+    if (!v) return;
+    const play = () => { try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {} };
+    let io = null;
+    try {
+      io = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) play();
+          else { try { v.pause(); } catch (err) {} }
+        });
+      }, { threshold: 0.2 });
+      io.observe(v);
+    } catch (e) { play(); }
+    return () => { try { if (io) io.disconnect(); } catch (e) {} };
+  }, [failed, type]);
+
+  if (failed) return React.createElement(ExerciseScheme, { type: (type), color: (color) });
+
+  return (
+    React.createElement("div", { className: ("ch-pictogram"), style: ({ background: "#0d0d10" }) },
+      React.createElement("video", {
+        key: (String(attempt)),
+        ref: (vref),
+        src: (base + type + ".webm"),
+        autoPlay: (true), loop: (true), muted: (true), playsInline: (true),
+        preload: ("metadata"), controls: (false),
+        onError: (() => setAttempt((n) => n + 1)),
+        style: ({ width: "100%", height: "100%", objectFit: "contain", display: "block", background: "#0d0d10" }),
+      }),
+      React.createElement("span", { className: ("ch-gif-badge") }, "СХЕМА ДВИЖЕНИЯ"),
+      muscle ? React.createElement("span", { className: ("ch-pic-legend") },
+        React.createElement("i", null), muscle) : null)
+  );
+}
+
 function ExerciseVideoCard({ ex, color, highlight }) {
   return (
-    React.createElement("div", {className: ("ch-card"), style: ({ borderColor: highlight ? "var(--green-500)" : undefined })}, React.createElement("div", {style: ({ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" })}, React.createElement("span", {className: ("ch-tag"), style: ({ background: `${color}22`, color })}, ex.machine), React.createElement("span", {className: ("ch-tag"), style: ({ background: `${LEVEL_COLOR[ex.level]}22`, color: LEVEL_COLOR[ex.level] })}, ex.level)), React.createElement("div", {style: ({ marginBottom: 10 })}, React.createElement(ExercisePictogram, {type: (ex.pict), color: (color)})), React.createElement("div", {style: ({ fontWeight: 600, fontSize: 14, marginBottom: 4 })}, ex.name), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-500)", marginBottom: 10 })}, "🎯 Целевая группа: ", ex.muscle), React.createElement("div", {style: ({
+    React.createElement("div", {className: ("ch-card"), style: ({ borderColor: highlight ? "var(--green-500)" : undefined })}, React.createElement("div", {style: ({ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" })}, React.createElement("span", {className: ("ch-tag"), style: ({ background: `${color}22`, color })}, ex.machine), React.createElement("span", {className: ("ch-tag"), style: ({ background: `${LEVEL_COLOR[ex.level]}22`, color: LEVEL_COLOR[ex.level] })}, ex.level)), React.createElement("div", {style: ({ marginBottom: 10 })}, React.createElement(ExercisePictogram, {type: (ex.pict), color: (color), muscle: (ex.muscle)})), React.createElement("div", {style: ({ fontWeight: 600, fontSize: 14, marginBottom: 4 })}, ex.name), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-500)", marginBottom: 10 })}, "🎯 Целевая группа: ", ex.muscle), React.createElement("div", {style: ({
         display: "flex", alignItems: "center", gap: 8, marginBottom: 12, padding: "9px 12px",
         borderRadius: 12, background: `${color}14`, border: `1px solid ${color}44`,
       })}, React.createElement(RotateCcw, {size: (14), color: (color), style: ({ flexShrink: 0 })}), React.createElement("div", null, React.createElement("div", {style: ({ fontSize: 10, color: "var(--grey-500)", marginBottom: 1 })}, "Подходы и повторения"), React.createElement("div", {style: ({ fontSize: 12, fontWeight: 600, color })}, ex.sets))), React.createElement("div", {style: ({ paddingTop: 12, borderTop: "1px solid var(--border-soft)" })}, React.createElement("div", {style: ({ fontSize: 12, fontWeight: 700, marginBottom: 10, color })}, "Как выполнять правильно"), React.createElement(SchemeSteps, {steps: (ex.scheme), color: (color)}), ex.errors && (
