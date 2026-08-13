@@ -877,11 +877,34 @@ const CHStore = (function () {
     targets: calcTargets(saved.profile),
     diary: saved.day === today ? (saved.diary || []) : [],
     chat: saved.day === today ? (saved.chat || []) : [],
-    water: 1.4,
+    plan: saved.day === today ? (saved.plan || null) : null,   // рацион на сегодня
+    activity: saved.day === today ? (saved.activity || []) : [], // движение за день
+    history: saved.history || [],                              // архив прошлых дней
+    tastes: saved.tastes || { likes: [], dislikes: [] },       // что человек любит и не ест
+    recent: saved.recent || [],                                // блюда последних дней — чтобы не повторяться
+    water: nOr(saved.day === today ? saved.water : 0, 0),
     day: today,
   };
+  /* день сменился — подводим итог вчерашнего и убираем в архив */
+  if (saved.day && saved.day !== today && (saved.diary || []).length) {
+    const d = saved.diary || [], act = saved.activity || [];
+    const sum = d.reduce((s, x) => ({
+      k: s.k + nOr(x.k, 0), p: s.p + nOr(x.p, 0), f: s.f + nOr(x.f, 0), c: s.c + nOr(x.c, 0) }), { k: 0, p: 0, f: 0, c: 0 });
+    const tg = calcTargets(saved.profile);
+    const burned = act.reduce((s, a) => s + nOr(a.k, 0), 0);
+    state.history = state.history.filter((h) => h.d !== saved.day).concat([{
+      d: saved.day,
+      k: Math.round(sum.k), p: Math.round(sum.p), f: Math.round(sum.f), c: Math.round(sum.c),
+      target: tg.kcal, burned: Math.round(burned), water: nOr(saved.water, 0),
+      meals: d.map((x) => ({ n: x.n, k: x.k, t: x.t })).slice(0, 20),
+    }]).slice(-120);
+  }
+
   const subs = new Set();
-  const persist = () => LS.set("crocus_state", { profile: state.profile, diary: state.diary, chat: state.chat.slice(-30), day: state.day });
+  const persist = () => LS.set("crocus_state", {
+    profile: state.profile, diary: state.diary, chat: state.chat.slice(-30),
+    plan: state.plan, tastes: state.tastes, recent: state.recent.slice(-40),
+    activity: state.activity, water: state.water, history: state.history.slice(-120), day: state.day });
   const emit = () => { persist(); subs.forEach((f) => { try { f(); } catch (e) {} }); };
   const set = (patch) => { state = Object.assign({}, state, patch); emit(); };
 
@@ -889,18 +912,67 @@ const CHStore = (function () {
     get: () => state,
     subscribe(f) { subs.add(f); return () => subs.delete(f); },
     setProfile(p) { set({ profile: p, targets: calcTargets(p) }); },
-    seed(list) { if (!state.diary.length) set({ diary: list.map((m) => ({ id: uid(), n: m.name, k: m.kcal, p: m.p || 0, f: m.f || 0, c: m.c || 0, t: m.time, src: "plan" })) }); },
+    seed(list) { /* кольцо стартует с нуля — ничего не подставляем */ },
+
+    /* ---- рацион на день ---- */
+    setPlan(meals) {
+      const list = (meals || []).map((m, i) => ({
+        id: "pm" + i + uid(), emoji: m.emoji || "🍽️", name: m.name || "Приём пищи",
+        time: m.time || "", type: m.type || "", why: m.why || "",
+        kcal: Math.round(nOr(m.kcal, 0)), p: Math.round(nOr(m.p, 0)),
+        f: Math.round(nOr(m.f, 0)), c: Math.round(nOr(m.c, 0)),
+        ingredients: Array.isArray(m.ingredients) ? m.ingredients : null,
+        steps: Array.isArray(m.steps) ? m.steps : null,
+      }));
+      const names = list.map((m) => m.name);
+      set({ plan: list, recent: state.recent.concat(names).slice(-40) });
+    },
+    clearPlan() { set({ plan: null }); },
+
+    /* ---- вкусы: запоминаем, что человек любит ---- */
+    remember(likes, dislikes) {
+      const norm = (a) => (Array.isArray(a) ? a : []).map((x) => String(x).trim().toLowerCase()).filter(Boolean);
+      const uniq = (a) => Array.from(new Set(a)).slice(-30);
+      set({ tastes: {
+        likes: uniq(state.tastes.likes.concat(norm(likes))),
+        dislikes: uniq(state.tastes.dislikes.concat(norm(dislikes))),
+      } });
+    },
+    forgetTaste(word) {
+      const w = String(word).toLowerCase();
+      set({ tastes: {
+        likes: state.tastes.likes.filter((x) => x !== w),
+        dislikes: state.tastes.dislikes.filter((x) => x !== w),
+      } });
+    },
+    setWater(l) { set({ water: Math.max(0, Math.round(nOr(l, 0) * 10) / 10) }); },
+
+    /* ---- активность: сожжённое добавляется к дневной норме ---- */
+    addActivity(name, kcal, mins) {
+      const id = uid();
+      set({ activity: state.activity.concat([{ id: id, n: name || "Активность",
+        k: Math.max(0, Math.round(nOr(kcal, 0))), m: Math.round(nOr(mins, 0)),
+        t: new Date().toTimeString().slice(0, 5) }]) });
+      return id;
+    },
+    removeActivity(id) { set({ activity: state.activity.filter((a) => a.id !== id) }); },
     addDiary(e) {
+      const id = uid();
       set({ diary: state.diary.concat([{
-        id: uid(), n: e.n || e.name || "Приём пищи",
+        id: id, n: e.n || e.name || "Приём пищи",
         k: Math.round(nOr(e.k != null ? e.k : e.kcal, 0)),
         p: Math.round(nOr(e.p, 0)), f: Math.round(nOr(e.f, 0)), c: Math.round(nOr(e.c, 0)),
-        g: Math.round(nOr(e.g, 0)), t: e.t || new Date().toTimeString().slice(0, 5), src: e.src || "photo",
+        g: Math.round(nOr(e.g, 0)), t: e.t || new Date().toTimeString().slice(0, 5),
+        src: e.src || "photo", ref: e.ref || null,
       }]) });
+      return id;
     },
+    removeByRef(ref) { set({ diary: state.diary.filter((d) => d.ref !== ref) }); },
     removeDiary(id) { set({ diary: state.diary.filter((d) => d.id !== id) }); },
     setChat(list) { set({ chat: list }); },
-    reset() { LS.del("crocus_state"); set({ profile: null, diary: [], chat: [], targets: calcTargets(null) }); },
+    reset() { LS.del("crocus_state"); set({ profile: null, diary: [], chat: [], plan: null,
+      tastes: { likes: [], dislikes: [] }, recent: [], activity: [], water: 0, history: [],
+      targets: calcTargets(null) }); },
   };
 })();
 
@@ -908,6 +980,9 @@ function useStore() {
   const [, force] = useState(0);
   useEffect(() => CHStore.subscribe(() => force((n) => n + 1)), []);
   return CHStore.get();
+}
+function burnedToday(activity) {
+  return (activity || []).reduce((s, a) => s + nOr(a.k, 0), 0);
 }
 function eatenToday(diary) {
   return (diary || []).reduce((s, d) => ({ k: s.k + nOr(d.k, 0), p: s.p + nOr(d.p, 0), f: s.f + nOr(d.f, 0), c: s.c + nOr(d.c, 0) }), { k: 0, p: 0, f: 0, c: 0 });
@@ -1014,6 +1089,7 @@ function buildAppKB() {
 Помощник — этот чат.
 План — рацион по приёмам пищи, рецепты домашних блюд, доставка готовой еды, подбор с учётом вкусов.
 Поиск — поиск рецептов и разделов приложения по запросу.
+Календарь — история питания по дням: месяц сеткой, серия дней подряд, средние калории. Открывается из раздела «Ещё».
 Зал — программа на 3 дня в зале и дома, база упражнений с техникой и ошибками, карточка «Съёмка техники выполнения» (6 кадров → AI-разбор).
 Ещё — Crocus Nutrition (своя спортпит-линейка), Crocus Healthy Food Cafe, вода Crocus Vital, единомышленники, мои результаты, корзина.
 
@@ -1045,6 +1121,7 @@ function buildCoachSystem() {
 Тренируется: ${p.location || "не указано"}
 Ограничения в питании: ${p.diet || "нет"}
 Любимые продукты: ${(p.favFoods || []).join(", ") || "не указаны"}
+Что успел запомнить о вкусах: любит — ${(st.tastes && st.tastes.likes || []).join(", ") || "пока ничего"}; не ест — ${(st.tastes && st.tastes.dislikes || []).join(", ") || "ограничений нет"}
 Спорт и хобби: ${hobbies || (p.sportHobbies || []).join(", ") || "не указаны"}
 Особенности здоровья: ${p.hasIssues && p.issuesText ? p.issuesText : "не отмечены"}
 
@@ -1054,14 +1131,26 @@ function buildCoachSystem() {
 Съедено: ${Math.round(e.k)} ккал · Б ${Math.round(e.p)} · Ж ${Math.round(e.f)} · У ${Math.round(e.c)}
 Осталось: ${Math.round(t.kcal - e.k)} ккал · Б ${Math.round(t.p - e.p)} · Ж ${Math.round(t.f - e.f)} · У ${Math.round(t.c - e.c)}
 Дневник: ${st.diary.length ? st.diary.map((d) => d.n + " " + d.k + " ккал").join("; ") : "пусто"}
+Движение сегодня: ${(st.activity || []).length ? st.activity.map((a) => a.n + " +" + a.k + " ккал").join("; ") + " — итого +" + burnedToday(st.activity) + " ккал к норме" : "пока не было"}
+Норма с учётом движения: ${t.kcal + burnedToday(st.activity)} ккал
+Вода: ${st.water} из ${t.water} л
+Время сейчас: ${new Date().toTimeString().slice(0, 5)}
+План на день: ${st.plan && st.plan.length ? st.plan.map((m) => m.type + " — " + m.name + " " + m.kcal + " ккал").join("; ") : "не собран"}
+Блюда последних дней (не повторяйся): ${(st.recent || []).slice(-15).join("; ") || "нет"}
+История по дням: ${(st.history || []).slice(-7).map((h) => h.d.slice(5) + ": " + h.k + " из " + (h.target + (h.burned || 0)) + " ккал").join("; ") || "пока пусто"}
 
 ${buildAppKB()}
 
 КАК ОТВЕЧАТЬ
 - Живым разговорным русским, 2–5 предложений. Без markdown, без заголовков и списков со звёздочками.
-- Опирайся на реальные цифры выше: сколько осталось калорий и белка, что уже съедено.
+- Опирайся на реальные цифры выше: сколько осталось калорий и белка, что уже съедено, сколько времени до конца дня.
+- Если в истории видно закономерность (регулярный недобор белка, скачки калорий, пропуски дней) — скажи об этом мягко и по делу, когда это уместно.
+- Считай день целиком. Если человек спрашивает, что съесть сейчас, прикинь, сколько приёмов пищи ещё впереди, и оставь на них калории. Прямо говори: «возьми что-то на 400–450, тогда на ужин останется около 600».
+- Если калорий в обрез, а человек голоден — предложи не только урезать еду, но и добавить движение: прогулку, лестницу, разминку. Скажи, сколько это даст.
+- Если норма почти выбрана, а день не кончился — предложи лёгкий вариант или добавить активность, но без вины и без запретов.
+- Если белка не хватает, а калорий мало — предложи белковое: творог, яйца, рыбу, протеин Crocus Nutrition.
+- Когда предлагаешь еду — давай конкретные блюда с примерной калорийностью, а не общие слова. Домашняя русская кухня и обычные продукты, а не киноа с авокадо каждый раз. Не повторяй то, что уже было на этой неделе.
 - Когда спрашивают «где найти», «как это работает» — объясняй по устройству приложения и называй конкретный раздел.
-- Когда просят подобрать еду — предлагай конкретные позиции из каталога с ценами и калорийностью.
 - Когда спрашивают про упражнения — опирайся на программу и базу техники из приложения.
 - Обращайся по имени, если оно известно. Помни, о чём говорили выше в диалоге.
 - Если чего-то не знаешь или этого нет в приложении — скажи прямо, не выдумывай функции и цены.
@@ -1074,8 +1163,19 @@ ${buildAppKB()}
 - Про технику упражнений отвечай общими принципами; для разбора конкретного подхода отправляй в раздел «Зал» к съёмке техники.
 
 ФОРМАТ — только валидный JSON, без markdown:
-{"reply":"ответ пользователю обычным текстом","chips":["короткий следующий вопрос","ещё один"],"goto":null}
-goto — если ответ логично продолжить в другом разделе, поставь один из: "home","plan","search","gym","cart","nutrition","cafe","water","results","community". Иначе null.`;
+{"reply":"ответ пользователю обычным текстом","chips":["короткий следующий вопрос","ещё один"],"goto":null,"add":[],"activity":[],"remember":{"likes":[],"dislikes":[]},"water":null,"replan":false}
+
+goto — если ответ логично продолжить в другом разделе, поставь один из: "home","plan","search","gym","cart","nutrition","cafe","water","results","community","calendar". Иначе null.
+
+add — массив блюд, которые НУЖНО записать в дневник. Заполняй ТОЛЬКО когда человек сообщил, что уже съел что-то, или прямо попросил записать. Формат: [{"name":"Творог с мёдом","kcal":220,"p":26,"f":5,"c":18}]. Оценивай честно по порции, о которой сказал человек. Если человек просто спрашивает совета — оставляй пустым.
+
+remember — что нового узнал о вкусах. likes: продукты и блюда, которые человек назвал любимыми. dislikes: что не ест, не любит, на что аллергия. Только новое, короткими словами («скумбрия», «грибы»). Обычно пустое.
+
+water — если человек сказал, что выпил воды, поставь общее число литров за день с учётом уже выпитого. Иначе null.
+
+activity — массив активностей, если человек рассказал, что двигался: [{"name":"Прогулка 40 минут","kcal":150,"mins":40}]. Оценивай расход честно по весу и длительности. Эти калории добавятся к дневной норме. Обычно пустой.
+
+replan — true, только если человек просит пересобрать рацион на день.`;
 }
 
 async function aiCoach(history) {
@@ -1090,8 +1190,84 @@ async function aiCoach(history) {
   return j;
 }
 
+/* ═══════════ АГЕНТ 4 · рацион на день ═══════════ */
+function tasteLine() {
+  const st = CHStore.get(), p = st.profile || {}, t = st.tastes || { likes: [], dislikes: [] };
+  const likes = Array.from(new Set([].concat(p.favFoods || [], t.likes || []))).join(", ");
+  const dis = (t.dislikes || []).join(", ");
+  return { likes: likes || "не указаны", dislikes: dis || "нет", recent: (st.recent || []).slice(-18).join("; ") || "нет" };
+}
+
+async function aiDayPlan(opts) {
+  if (!aiReady()) throw new Error("AI не подключён");
+  const st = CHStore.get(), p = st.profile || {}, t = st.targets, e = eatenToday(st.diary);
+  const tl = tasteLine();
+  const goal = p.goal === "gain" ? "набор мышечной массы" : p.goal === "keep" ? "поддержание формы" : "снижение веса";
+  const left = { k: Math.round(t.kcal - e.k), p: Math.round(t.p - e.p), f: Math.round(t.f - e.f), c: Math.round(t.c - e.c) };
+  const partial = e.k > 100;
+
+  const system = `Ты — Степан, нутрициолог приложения Crocus Health. Составляешь дневной рацион под конкретного человека.
+
+ПРИНЦИПЫ
+- Блюда настоящие, домашние, из продуктов обычного российского магазина. Гречка, творог, куриное бедро, скумбрия, кабачки, свёкла, перловка, индейка, судак, тыква, фасоль, кефир — работай этим, а не киноа с авокадо в каждом приёме.
+- Русская и соседняя кухня приветствуется: щи, запеканки, котлеты на пару, голубцы, драники из кабачка, сырники, окрошка, солянка, плов, шурпа, пельмени домашние.
+- КАЖДЫЙ РАЗ ДРУГОЕ. Не повторяй блюда из списка недавних. Меняй белок, гарнир, способ готовки и кухню.
+- Учитывай сезон: сейчас ${new Date().toLocaleDateString("ru-RU", { month: "long" })}.
+- Готовка простая: 15–40 минут, без редких ингредиентов и оборудования.
+- Калорийность и БЖУ — честная оценка на порцию целиком. Сумма по всем приёмам должна сойтись с нормой в пределах 5%.
+
+ЗАПРЕТЫ
+- Не назначай меньше 1500 ккал в сутки, не предлагай голодание, детоксы и отказ от групп продуктов без медицинской причины.
+- Не делишь еду на «хорошую» и «плохую».
+
+ФОРМАТ — только валидный JSON, без markdown и без текста вокруг:
+{"meals":[{"emoji":"🍳","name":"Название блюда","type":"Завтрак","time":"08:30","kcal":420,"p":28,"f":18,"c":36,"why":"одна короткая фраза, чем это блюдо хорошо именно сейчас","ingredients":["Продукт — 150 г","..."],"steps":["Шаг 1","Шаг 2","Шаг 3"]}],"note":"одно-два предложения от Степана про этот день"}`;
+
+  const ask = `Собери рацион для человека.
+
+Профиль: ${p.name || "без имени"}, ${p.gender || "?"}, ${p.age || "?"} лет, ${p.height || "?"} см, ${p.weight || "?"} кг. Цель: ${goal}. Образ жизни: ${p.lifestyle || "не указан"}.
+Ограничения в питании: ${p.diet || "нет"}. Здоровье: ${p.hasIssues && p.issuesText ? p.issuesText : "без особенностей"}.
+Любит: ${tl.likes}
+Не ест: ${tl.dislikes}
+Недавно уже было (НЕ ПОВТОРЯЙ): ${tl.recent}
+
+${partial
+  ? `Человек сегодня уже съел ${Math.round(e.k)} ккал (Б ${Math.round(e.p)}, Ж ${Math.round(e.f)}, У ${Math.round(e.c)}). Собери оставшиеся приёмы пищи на ${left.k} ккал, Б ${left.p} г, Ж ${left.f} г, У ${left.c} г. Столько блюд, сколько уместно до конца дня.`
+  : `Норма на день: ${t.kcal} ккал, Б ${t.p} г, Ж ${t.f} г, У ${t.c} г. Сделай 4 приёма пищи: завтрак, обед, перекус, ужин.`}
+${opts && opts.hint ? "Дополнительно от человека: " + opts.hint : ""}`;
+
+  const text = await callClaude({ system: system, messages: [{ role: "user", content: ask }], maxTokens: 3000, temperature: 0.9 });
+  const j = parseAiJson(text);
+  if (!j || !Array.isArray(j.meals) || !j.meals.length) throw new Error("Не получилось собрать рацион, попробуйте ещё раз.");
+  return j;
+}
+
+/* ═══════════ АГЕНТ 5 · рецепт любого блюда ═══════════ */
+async function aiRecipe(dish) {
+  if (!aiReady()) throw new Error("AI не подключён");
+  const st = CHStore.get(), p = st.profile || {};
+  const tl = tasteLine();
+  const system = `Ты — Степан, повар и нутрициолог приложения Crocus Health. Даёшь рабочий рецепт домашнего блюда.
+
+Пиши так, чтобы человек реально приготовил: точная граммовка, понятные шаги, температура и время. Продукты — из обычного российского магазина. Калорийность и БЖУ считай на одну порцию честно, без занижения.
+Если запрос не про еду — верни поле error с короткой фразой.
+
+ФОРМАТ — только валидный JSON, без markdown:
+{"name":"Точное название блюда","kcal":420,"p":34,"f":10,"c":48,"time":"25 мин","portions":2,"ingredients":["Продукт — 150 г","..."],"steps":["Шаг 1","..."],"tip":"один короткий совет повара","error":null}`;
+
+  const ask = `Блюдо: «${dish}»
+Кто готовит: ${p.name || "человек"}, цель — ${p.goal === "gain" ? "набор массы" : p.goal === "lose" ? "снижение веса" : "поддержание формы"}.
+Ограничения: ${p.diet || "нет"}. Не ест: ${tl.dislikes}.
+Если у блюда есть более полезная домашняя версия — сделай её, но не превращай блюдо в другое.`;
+
+  const text = await callClaude({ system: system, messages: [{ role: "user", content: ask }], maxTokens: 1600, temperature: 0.7 });
+  const j = parseAiJson(text);
+  if (!j || j.error || !j.name || !Array.isArray(j.steps)) throw new Error((j && j.error) || "Не удалось собрать рецепт.");
+  return j;
+}
+
 /* ---------- регистрируем хуки приложения ---------- */
-window.CrocusAI = { recognizeFood: aiRecognizeFood, checkTechnique: aiCheckTechnique };
+window.CrocusAI = { recognizeFood: aiRecognizeFood, checkTechnique: aiCheckTechnique, dayPlan: aiDayPlan, recipe: aiRecipe };
 
 /* ═══════════ Настройки подключения (оверлей на чистом DOM) ═══════════ */
 function openAiSettings() {
@@ -1165,20 +1341,118 @@ function AiStatus({ compact }) {
 }
 
 /* ---------- живое кольцо дня ---------- */
+/* ---------- классическое кольцо калорий ---------- */
+function CalorieDonut({ eaten, target, size }) {
+  size = size || 168;
+  const stroke = 13, r = (size - stroke) / 2, C = 2 * Math.PI * r;
+  const pct = Math.max(0, Math.min(1.25, eaten / Math.max(1, target)));
+  const over = eaten > target;
+  const color = over ? "#fb7185" : pct > 0.85 ? "#fbbf24" : "var(--green-400)";
+  const left = Math.round(target - eaten);
+
+  return React.createElement("div", { style: ({ position: "relative", width: size, height: size, flexShrink: 0 }) },
+    React.createElement("svg", { width: (size), height: (size), style: ({ transform: "rotate(-90deg)" }) },
+      React.createElement("circle", { cx: (size / 2), cy: (size / 2), r: (r), fill: ("none"),
+        stroke: ("var(--bg-elev-2)"), strokeWidth: (stroke) }),
+      React.createElement("circle", { cx: (size / 2), cy: (size / 2), r: (r), fill: ("none"),
+        stroke: (color), strokeWidth: (stroke), strokeLinecap: ("round"),
+        strokeDasharray: (C), strokeDashoffset: (C * (1 - Math.min(1, pct))),
+        style: ({ transition: "stroke-dashoffset .6s cubic-bezier(.2,.8,.3,1), stroke .3s" }) })),
+    React.createElement("div", { style: ({
+      position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", gap: 1 }) },
+      React.createElement("div", { style: ({ fontSize: 15, lineHeight: 1, marginBottom: 3 }) }, "🍏"),
+      React.createElement("div", { className: ("mono"), style: ({ fontSize: 27, fontWeight: 700, lineHeight: 1, color: color }) },
+        Math.round(eaten)),
+      React.createElement("div", { style: ({ fontSize: 10, color: "var(--grey-500)", marginTop: 2 }) }, "из " + target + " ккал"),
+      React.createElement("div", { style: ({ fontSize: 10.5, color: over ? "#fb7185" : "var(--grey-400)", marginTop: 5, fontWeight: 600 }) },
+        over ? "перебор " + Math.abs(left) : "осталось " + left)));
+}
+
+/* ---------- полоса макронутриента с процентами ---------- */
+function MacroBar({ label, eaten, target, color, share, idealShare }) {
+  const pct = Math.min(100, Math.round((eaten / Math.max(1, target)) * 100));
+  return React.createElement("div", { style: ({ flex: 1 }) },
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 }) },
+      React.createElement("span", { style: ({ fontSize: 11.5, fontWeight: 600 }) }, label),
+      React.createElement("span", { className: ("mono"), style: ({ fontSize: 10.5, color: "var(--grey-500)" }) },
+        Math.round(eaten) + " / " + target + " г")),
+    React.createElement("div", { style: ({ height: 6, borderRadius: 6, background: "var(--bg-elev-2)", overflow: "hidden" }) },
+      React.createElement("div", { style: ({ height: "100%", width: pct + "%", background: color, borderRadius: 6,
+        transition: "width .5s cubic-bezier(.2,.8,.3,1)" }) })),
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", marginTop: 4 }) },
+      React.createElement("span", { className: ("mono"), style: ({ fontSize: 9.5, color: color }) }, share + "% рациона"),
+      React.createElement("span", { className: ("mono"), style: ({ fontSize: 9.5, color: "var(--grey-600, #574d70)" }) }, "цель " + idealShare + "%")));
+}
+
+/* ---------- подсказка по добавкам, когда чего-то не хватает ---------- */
+function SupplementHint({ goto }) {
+  const st = useStore();
+  const e = eatenToday(st.diary), t = st.targets;
+  const hour = new Date().getHours();
+  if (hour < 15) return null;                       // советуем только во второй половине дня
+  const pLeft = t.p - e.p;
+  if (pLeft < 25) return null;                      // белка хватает — молчим
+  return React.createElement("div", { className: ("ch-card-soft"), style: ({
+      display: "flex", gap: 11, alignItems: "center", marginBottom: 12,
+      borderColor: "rgba(167,139,250,0.3)", cursor: "pointer" }),
+      onClick: (() => goto && goto("nutrition")) },
+    React.createElement("div", { style: ({ width: 36, height: 36, borderRadius: 11, background: "rgba(167,139,250,0.16)",
+      display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17, flexShrink: 0 }) }, "🥤"),
+    React.createElement("div", { style: ({ flex: 1 }) },
+      React.createElement("div", { style: ({ fontSize: 12.5, fontWeight: 600 }) }, "Не добираете " + Math.round(pLeft) + " г белка"),
+      React.createElement("div", { style: ({ fontSize: 11, color: "var(--grey-500)", marginTop: 2 }) },
+        "Порция протеина Crocus Nutrition закроет большую часть")),
+    React.createElement(ChevronRight, { size: (16), color: ("var(--green-400)") }));
+}
+
 function DailyRing() {
   const st = useStore();
   const e = eatenToday(st.diary), t = st.targets;
-  const filled = Math.max(0, Math.min(6, Math.round((e.k / Math.max(1, t.kcal)) * 6)));
-  return (
-    React.createElement(React.Fragment, null,
-      React.createElement(PetalRing, { size: (92), filled: (filled) },
-        React.createElement("div", { className: ("mono"), style: ({ fontSize: 15, fontWeight: 700 }) }, Math.round(e.k)),
-        React.createElement("div", { style: ({ fontSize: 9, color: "var(--grey-500)" }) }, "из " + t.kcal + " ккал")),
-      React.createElement("div", { style: ({ flex: 1, display: "flex", flexDirection: "column", gap: 10 }) },
-        React.createElement(MacroPill, { icon: (Beef), label: ("Белки"), value: (Math.round(e.p) + " / " + t.p), unit: ("г"), color: ("#a78bfa") }),
-        React.createElement(MacroPill, { icon: (Wheat), label: ("Углеводы"), value: (Math.round(e.c) + " / " + t.c), unit: ("г"), color: ("#f472b6") }),
-        React.createElement(MacroPill, { icon: (Droplet), label: ("Вода"), value: (st.water), unit: ("л"), color: ("#38bdf8") })))
-  );
+  const burned = burnedToday(st.activity);
+  const target = t.kcal + burned;          // движение расширяет дневную норму
+  /* доля каждого макроса в съеденном и в норме — в процентах калорий */
+  const kEat = Math.max(1, e.p * 4 + e.f * 9 + e.c * 4);
+  const kTar = Math.max(1, t.p * 4 + t.f * 9 + t.c * 4);
+  const sh = (g, mult, base) => Math.round((g * mult * 100) / base);
+
+  return React.createElement("div", { style: ({ width: "100%" }) },
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "center", marginBottom: burned ? 8 : 16 }) },
+      React.createElement(CalorieDonut, { eaten: (e.k), target: (target) })),
+    burned ? React.createElement("div", { style: ({ textAlign: "center", marginBottom: 14, fontSize: 11,
+      color: "var(--pink-400)" }) }, "+" + burned + " ккал за активность · норма " + t.kcal + " + движение") : null,
+    React.createElement("div", { style: ({ display: "flex", flexDirection: "column", gap: 12 }) },
+      React.createElement(MacroBar, { label: ("Белки"), eaten: (e.p), target: (t.p), color: ("#a78bfa"),
+        share: (e.k ? sh(e.p, 4, kEat) : 0), idealShare: (sh(t.p, 4, kTar)) }),
+      React.createElement(MacroBar, { label: ("Жиры"), eaten: (e.f), target: (t.f), color: ("#fbbf24"),
+        share: (e.k ? sh(e.f, 9, kEat) : 0), idealShare: (sh(t.f, 9, kTar)) }),
+      React.createElement(MacroBar, { label: ("Углеводы"), eaten: (e.c), target: (t.c), color: ("#f472b6"),
+        share: (e.k ? sh(e.c, 4, kEat) : 0), idealShare: (sh(t.c, 4, kTar)) })),
+    React.createElement(WaterRow, null));
+}
+
+/* ---------- вода: реально добавляется стаканами ---------- */
+function WaterRow() {
+  const st = useStore();
+  const t = st.targets;
+  const pct = Math.min(100, Math.round((st.water / Math.max(0.1, t.water)) * 100));
+  return React.createElement("div", { style: ({ marginTop: 14, paddingTop: 13, borderTop: "1px solid var(--border-soft)" }) },
+    React.createElement("div", { style: ({ display: "flex", alignItems: "center", gap: 10 }) },
+      React.createElement(Droplet, { size: (15), color: ("#38bdf8") }),
+      React.createElement("div", { style: ({ flex: 1 }) },
+        React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", marginBottom: 4 }) },
+          React.createElement("span", { style: ({ fontSize: 11.5, fontWeight: 600 }) }, "Вода"),
+          React.createElement("span", { className: ("mono"), style: ({ fontSize: 10.5, color: "var(--grey-500)" }) },
+            st.water.toFixed(1) + " / " + t.water + " л")),
+        React.createElement("div", { style: ({ height: 6, borderRadius: 6, background: "var(--bg-elev-2)", overflow: "hidden" }) },
+          React.createElement("div", { style: ({ height: "100%", width: pct + "%", background: "#38bdf8", borderRadius: 6, transition: "width .4s" }) }))),
+      React.createElement("button", { onClick: (() => CHStore.setWater(Math.max(0, st.water - 0.25))), style: ({
+        width: 30, height: 30, borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-elev)",
+        color: "var(--grey-400)", fontSize: 16, cursor: "pointer", lineHeight: 1 }) }, "−"),
+      React.createElement("button", { onClick: (() => CHStore.setWater(st.water + 0.25)), style: ({
+        width: 30, height: 30, borderRadius: 9, border: "1px solid var(--green-500)", background: "rgba(52,211,153,0.14)",
+        color: "var(--green-400)", fontSize: 16, cursor: "pointer", lineHeight: 1 }) }, "+")),
+    React.createElement("div", { style: ({ fontSize: 10, color: "var(--grey-600, #574d70)", marginTop: 5 }) }, "Один стакан — 250 мл"));
 }
 
 /* ---------- дневник за сегодня ---------- */
@@ -2214,11 +2488,11 @@ function HomeScreen({ profile, goto }) {
     React.createElement("div", {className: ("ch-scroll")}, React.createElement("div", {style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 10, marginBottom: 16 })}, React.createElement("div", null, React.createElement("div", {className: ("ch-eyebrow")}, goalLabel), React.createElement("div", {className: ("disp"), style: ({ fontSize: 20, fontWeight: 700 })}, "Привет, ", profile?.name || "друг", " 👋")), React.createElement("div", {style: ({
           width: 40, height: 40, borderRadius: 12, background: "var(--bg-elev-2)", border: "1px solid var(--border)",
           display: "flex", alignItems: "center", justifyContent: "center",
-        })}, React.createElement("span", {style: ({ fontSize: 15 })}, "🍏"))), React.createElement("div", {className: ("ch-card"), style: ({ display: "flex", alignItems: "center", gap: 16, marginBottom: 14 })}, React.createElement(DailyRing, null)), React.createElement("div", {className: ("ch-card-brand"), style: ({ marginBottom: 16, cursor: "pointer" }), onClick: (() => goto("ai"))}, React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {style: ({
+        })}, React.createElement("span", {style: ({ fontSize: 15 })}, "🍏"))), React.createElement("div", {className: ("ch-card"), style: ({ marginBottom: 14 })}, React.createElement(DailyRing, null)), React.createElement(WeekBlock, {goto: (goto)}), React.createElement("div", {className: ("ch-card-brand"), style: ({ marginBottom: 16, cursor: "pointer" }), onClick: (() => goto("ai"))}, React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {style: ({
             width: 42, height: 42, borderRadius: "50%", flexShrink: 0,
             background: "linear-gradient(135deg, #8b5cf6, #d946ef)",
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20,
-          })}, "🌿"), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ fontSize: 13.5, fontWeight: 700 })}, "Степан · AI-помощник"), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-400)", marginTop: 2 })}, "Спросите про питание, тренировки или расписание")), React.createElement(ChevronRight, {size: (18), color: ("var(--green-400)")}))), React.createElement("div", {className: ("ch-card"), style: ({ marginBottom: 16, cursor: "pointer", borderColor: "rgba(52,211,153,0.35)" }), onClick: (() => goto("results"))}, React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {className: ("ch-photo"), style: ({ width: 40, height: 40, background: "linear-gradient(135deg, #34d399, #8b5cf6)", flexShrink: 0 })}, React.createElement("span", {className: ("ch-photo-inner"), style: ({ fontSize: 18 })}, "📈")), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ fontSize: 13, fontWeight: 600 })}, "Мои результаты"), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-500)" })}, "Вес, мышцы и рабочие веса в зале")), React.createElement(ChevronRight, {size: (17), color: ("var(--green-400)")}))), React.createElement(PhotoCalorieCard, null), React.createElement("div", {style: ({ marginTop: 6, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" })}, React.createElement("div", {className: ("ch-h2"), style: ({ marginBottom: 0 })}, "🍽️ Рацион на сегодня"), React.createElement("div", {style: ({ fontSize: 12, color: "var(--green-400)", display: "flex", alignItems: "center", gap: 2, cursor: "pointer" }), onClick: (() => goto("plan"))}, "Все ", React.createElement(ChevronRight, {size: (14)}))), React.createElement("div", {style: ({ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 })}, MEALS_TODAY.map((m) => (React.createElement(MealRow, {key: (m.id), meal: (m)})))), React.createElement("div", {className: ("ch-card"), style: ({ display: "flex", gap: 12, alignItems: "center", marginBottom: 10 })}, React.createElement("div", {style: ({ width: 40, height: 40, borderRadius: 12, background: "rgba(244,114,182,0.16)", display: "flex", alignItems: "center", justifyContent: "center" })}, React.createElement(Bike, {size: (18), color: ("var(--pink-400)")})), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ fontWeight: 600, fontSize: 13 })}, "Замените лифт на лестницу"), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-500)" })}, "Микро-активность · 3 мин · +18 ккал")), React.createElement("button", {className: ("ch-btn ch-btn-ghost"), style: ({ padding: "8px 12px", fontSize: 11.5 })}, "Принять")))
+          })}, "🌿"), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ fontSize: 13.5, fontWeight: 700 })}, "Степан · AI-помощник"), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-400)", marginTop: 2 })}, "Спросите про питание, тренировки или расписание")), React.createElement(ChevronRight, {size: (18), color: ("var(--green-400)")}))), React.createElement("div", {className: ("ch-card"), style: ({ marginBottom: 16, cursor: "pointer", borderColor: "rgba(52,211,153,0.35)" }), onClick: (() => goto("results"))}, React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {className: ("ch-photo"), style: ({ width: 40, height: 40, background: "linear-gradient(135deg, #34d399, #8b5cf6)", flexShrink: 0 })}, React.createElement("span", {className: ("ch-photo-inner"), style: ({ fontSize: 18 })}, "📈")), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ fontSize: 13, fontWeight: 600 })}, "Мои результаты"), React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--grey-500)" })}, "Вес, мышцы и рабочие веса в зале")), React.createElement(ChevronRight, {size: (17), color: ("var(--green-400)")}))), React.createElement(PhotoCalorieCard, null), React.createElement(SupplementHint, {goto: (goto)}), React.createElement(TodayPlan, {goto: (goto), compact: (true)}), React.createElement(MicroActivity, null))
   );
 }
 
@@ -2302,7 +2576,41 @@ function AIAssistantScreen({ profile, goto }) {
     setMessages(hist); setMsg(""); setBusy(true); setChips([]);
     try {
       const r = await aiCoach(hist);
-      setMessages(hist.concat([{ from: "ai", text: r.reply, raw: r.raw, goto: r.goto || null }]));
+
+      /* --- Степан действует, а не только говорит --- */
+      const done = [];
+      if (Array.isArray(r.add)) {
+        r.add.slice(0, 6).forEach((m) => {
+          if (!m || !m.name || !isFinite(nOr(m.kcal, NaN))) return;
+          CHStore.addDiary({ n: m.name, k: m.kcal, p: m.p, f: m.f, c: m.c, src: "coach" });
+          done.push("записал «" + m.name + "» — " + Math.round(nOr(m.kcal, 0)) + " ккал");
+        });
+      }
+      if (Array.isArray(r.activity)) {
+        r.activity.slice(0, 4).forEach((a) => {
+          if (!a || !a.name || !isFinite(nOr(a.kcal, NaN))) return;
+          CHStore.addActivity(a.name, a.kcal, a.mins);
+          done.push("засчитал «" + a.name + "» — плюс " + Math.round(nOr(a.kcal, 0)) + " ккал к норме");
+        });
+      }
+      if (r.remember && (Array.isArray(r.remember.likes) || Array.isArray(r.remember.dislikes))) {
+        const L = r.remember.likes || [], D = r.remember.dislikes || [];
+        if (L.length || D.length) {
+          CHStore.remember(L, D);
+          done.push("запомнил про вкусы");
+        }
+      }
+      if (r.water != null && isFinite(nOr(r.water, NaN))) {
+        CHStore.setWater(r.water);
+        done.push("отметил воду — " + nOr(r.water, 0) + " л");
+      }
+      if (r.replan) {
+        try { const plan = await aiDayPlan({}); CHStore.setPlan(plan.meals); done.push("пересобрал рацион на день"); }
+        catch (e2) {}
+      }
+
+      setMessages(hist.concat([{ from: "ai", text: r.reply, raw: r.raw, goto: r.goto || null,
+        actions: done.length ? done : null }]));
       setChips(Array.isArray(r.chips) ? r.chips.filter((c) => typeof c === "string").slice(0, 3) : []);
     } catch (e) {
       setMessages(hist.concat([{ from: "ai", text: e.message || "Не получилось ответить", error: true }]));
@@ -2351,6 +2659,11 @@ function AIAssistantScreen({ profile, goto }) {
                   color: m.from === "me" ? "#fff" : m.error ? "#fb7185" : "var(--grey-300)",
                 })
               }, m.text)),
+            m.actions ? React.createElement("div", { style: ({ marginTop: 7, display: "flex", flexDirection: "column", gap: 4 }) },
+              m.actions.map((a, ai) => React.createElement("div", { key: (ai), style: ({
+                fontSize: 11, color: "var(--green-400)", background: "rgba(52,211,153,0.1)",
+                border: "1px solid rgba(52,211,153,0.25)", borderRadius: 100, padding: "4px 11px", alignSelf: "flex-start",
+              }) }, "✓ " + a))) : null,
             m.goto ? React.createElement("div", {
               className: ("ch-chip"), style: ({ marginTop: 7 }), onClick: (() => goto(m.goto)),
             }, "Открыть раздел →") : null)
@@ -2397,10 +2710,413 @@ function AIAssistantScreen({ profile, goto }) {
   );
 }
 
-function MealRow({ meal }) {
-  return (
-    React.createElement("div", {className: ("ch-card-soft"), style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {style: ({ fontSize: 22 })}, meal.emoji), React.createElement("div", {style: ({ flex: 1 })}, React.createElement("div", {style: ({ display: "flex", justifyContent: "space-between" })}, React.createElement("span", {style: ({ fontSize: 13, fontWeight: 600 })}, meal.name), React.createElement("span", {className: ("mono"), style: ({ fontSize: 12, color: "var(--grey-400)" })}, meal.kcal, " ккал")), React.createElement("div", {style: ({ fontSize: 11, color: "var(--grey-500)" })}, meal.time, " · ", meal.type)), meal.done ? React.createElement(CheckCircle2, {size: (18), color: ("var(--green-400)")}) : React.createElement(Circle, {size: (18), color: ("var(--grey-700)")}))
-  );
+function MealRow({ meal, onOpen }) {
+  const st = useStore();
+  const ref = "meal:" + meal.id;
+  const added = st.diary.some((d) => d.ref === ref);
+
+  const toggle = (ev) => {
+    ev.stopPropagation();
+    if (added) CHStore.removeByRef(ref);
+    else CHStore.addDiary({ n: meal.name, k: meal.kcal, p: meal.p, f: meal.f, c: meal.c,
+      t: meal.time || new Date().toTimeString().slice(0, 5), src: "plan", ref: ref });
+  };
+
+  return React.createElement("div", { className: ("ch-card-soft"), style: ({
+      display: "flex", alignItems: "center", gap: 12,
+      borderColor: added ? "var(--green-500)" : undefined,
+      cursor: onOpen ? "pointer" : "default" }),
+      onClick: (() => onOpen && onOpen(meal)) },
+    React.createElement("div", { style: ({ fontSize: 22 }) }, meal.emoji),
+    React.createElement("div", { style: ({ flex: 1, minWidth: 0 }) },
+      React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", gap: 8 }) },
+        React.createElement("span", { style: ({ fontSize: 13, fontWeight: 600 }) }, meal.name),
+        React.createElement("span", { className: ("mono"), style: ({ fontSize: 12, color: "var(--grey-400)", flexShrink: 0 }) },
+          meal.kcal, " ккал")),
+      React.createElement("div", { style: ({ fontSize: 11, color: "var(--grey-500)", marginTop: 2 }) },
+        (meal.time ? meal.time + " · " : "") + (meal.type || "") ),
+      React.createElement("div", { className: ("mono"), style: ({ fontSize: 10, color: "var(--grey-600, #574d70)", marginTop: 2 }) },
+        "Б " + meal.p + " · Ж " + meal.f + " · У " + meal.c)),
+    React.createElement("button", { onClick: (toggle), title: (added ? "Убрать из дневника" : "Добавить в дневник"), style: ({
+      width: 32, height: 32, borderRadius: 10, flexShrink: 0, cursor: "pointer",
+      border: added ? "1px solid var(--green-500)" : "1px solid var(--border)",
+      background: added ? "rgba(52,211,153,0.16)" : "var(--bg-elev)",
+      color: added ? "var(--green-400)" : "var(--grey-400)",
+      fontSize: 17, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" }) },
+      added ? "✓" : "+"));
+}
+
+/* ═══════════ Календарь: неделя и история ═══════════ */
+const DOW = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const ruDate = (iso) => {
+  const p = String(iso).split("-");
+  return p[2] + "." + p[1];
+};
+
+/* собираем последние N дней: архив + сегодня */
+function lastDays(st, n) {
+  const map = {};
+  (st.history || []).forEach((h) => { map[h.d] = h; });
+  const e = eatenToday(st.diary);
+  const today = isoDay(new Date());
+  map[today] = { d: today, k: Math.round(e.k), p: Math.round(e.p), f: Math.round(e.f), c: Math.round(e.c),
+    target: st.targets.kcal, burned: burnedToday(st.activity), water: st.water,
+    meals: (st.diary || []).map((x) => ({ n: x.n, k: x.k, t: x.t })), today: true };
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = new Date(); dt.setDate(dt.getDate() - i);
+    const iso = isoDay(dt);
+    out.push(map[iso] || { d: iso, k: 0, p: 0, f: 0, c: 0, target: st.targets.kcal, burned: 0, water: 0, meals: [], empty: true });
+  }
+  return out;
+}
+
+/* полоска недели на главной */
+function WeekStrip({ onPick, onOpen }) {
+  const st = useStore();
+  const days = lastDays(st, 7);
+  return React.createElement("div", { className: ("ch-card"), style: ({ marginBottom: 14 }) },
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }) },
+      React.createElement("span", { style: ({ fontSize: 13, fontWeight: 600 }) }, "🗓️ Неделя"),
+      React.createElement("span", { style: ({ fontSize: 11.5, color: "var(--green-400)", cursor: "pointer",
+        display: "flex", alignItems: "center", gap: 2 }), onClick: ((ev) => { ev.stopPropagation(); onOpen && onOpen(); }) },
+        "Календарь ", React.createElement(ChevronRight, { size: (13) }))),
+    React.createElement("div", { style: ({ display: "flex", gap: 5, justifyContent: "space-between" }) },
+      days.map((d) => {
+        const goal = d.target + (d.burned || 0);
+        const pct = Math.max(0, Math.min(1, d.k / Math.max(1, goal)));
+        const over = d.k > goal * 1.05;
+        const col = d.empty ? "var(--bg-elev-2)" : over ? "#fb7185" : pct >= 0.8 ? "var(--green-400)" : "#a78bfa";
+        const dow = DOW[new Date(d.d + "T12:00:00").getDay()];
+        return React.createElement("div", { key: (d.d), onClick: (() => onPick && onPick(d)), style: ({
+            flex: 1, cursor: "pointer", textAlign: "center" }) },
+          React.createElement("div", { style: ({ fontSize: 9.5, color: d.today ? "var(--green-400)" : "var(--grey-500)",
+            marginBottom: 5, fontWeight: d.today ? 700 : 400 }) }, dow),
+          React.createElement("div", { style: ({ height: 44, borderRadius: 8, background: "var(--bg-elev-2)",
+            display: "flex", alignItems: "flex-end", overflow: "hidden",
+            border: d.today ? "1px solid var(--green-500)" : "1px solid transparent" }) },
+            React.createElement("div", { style: ({ width: "100%", height: Math.round(pct * 100) + "%",
+              background: col, transition: "height .4s" }) })),
+          React.createElement("div", { className: ("mono"), style: ({ fontSize: 9, color: "var(--grey-500)", marginTop: 4 }) },
+            d.empty ? "—" : d.k));
+      })));
+}
+
+/* карточка выбранного дня */
+function DayDetail({ day, onClose }) {
+  if (!day) return null;
+  const goal = day.target + (day.burned || 0);
+  const left = goal - day.k;
+  return React.createElement("div", { className: ("ch-card ch-scale-in"), style: ({ marginBottom: 14, borderColor: "var(--green-500)" }) },
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }) },
+      React.createElement("span", { style: ({ fontSize: 13.5, fontWeight: 700 }) },
+        day.today ? "Сегодня · " + ruDate(day.d) : ruDate(day.d)),
+      React.createElement("span", { onClick: (onClose), style: ({ cursor: "pointer", fontSize: 15, color: "var(--grey-500)" }) }, "✕")),
+    day.empty
+      ? React.createElement("div", { className: ("ch-sub"), style: ({ margin: 0 }) }, "В этот день записей не было.")
+      : React.createElement(React.Fragment, null,
+          React.createElement("div", { style: ({ display: "flex", gap: 8, marginBottom: 12 }) },
+            [{ l: "Съедено", v: day.k + " ккал", c: "var(--green-400)" },
+             { l: "Норма", v: goal + " ккал", c: "var(--grey-300)" },
+             { l: left >= 0 ? "Осталось" : "Перебор", v: Math.abs(left) + "", c: left >= 0 ? "var(--grey-300)" : "#fb7185" }
+            ].map((x) => React.createElement("div", { key: (x.l), className: ("ch-card-soft"), style: ({ flex: 1, textAlign: "center", padding: "9px 4px" }) },
+              React.createElement("div", { style: ({ fontSize: 9.5, color: "var(--grey-500)", marginBottom: 3 }) }, x.l),
+              React.createElement("div", { className: ("mono"), style: ({ fontSize: 12.5, fontWeight: 700, color: x.c }) }, x.v)))),
+          React.createElement("div", { className: ("mono"), style: ({ fontSize: 11, color: "var(--grey-500)", marginBottom: 10 }) },
+            "Б " + day.p + " · Ж " + day.f + " · У " + day.c +
+            (day.burned ? " · движение +" + day.burned : "") +
+            (day.water ? " · вода " + day.water + " л" : "")),
+          day.meals && day.meals.length
+            ? React.createElement("div", null, day.meals.map((m, i) => React.createElement("div", { key: (i), style: ({
+                display: "flex", justifyContent: "space-between", fontSize: 11.5, color: "var(--grey-300)", marginBottom: 4 }) },
+                React.createElement("span", null, (m.t ? m.t + " · " : "") + m.n),
+                React.createElement("span", { className: ("mono"), style: ({ color: "var(--grey-500)" }) }, m.k + " ккал"))))
+            : null));
+}
+
+/* полоска недели с раскрытием выбранного дня */
+function WeekBlock({ goto }) {
+  const [day, setDay] = useState(null);
+  return React.createElement(React.Fragment, null,
+    React.createElement(WeekStrip, { onPick: ((d) => setDay(day && day.d === d.d ? null : d)),
+      onOpen: (() => goto && goto("calendar")) }),
+    day ? React.createElement(DayDetail, { day: (day), onClose: (() => setDay(null)) }) : null);
+}
+
+/* полная история — в разделе результатов */
+function HistoryBlock() {
+  const st = useStore();
+  const [open, setOpen] = useState(null);
+  const days = lastDays(st, 30).filter((d) => !d.empty).reverse();
+  if (!days.length) return React.createElement("div", { className: ("ch-card-soft") },
+    React.createElement("span", { className: ("ch-sub"), style: ({ margin: 0 }) },
+      "История появится, когда начнёте отмечать еду. Каждый день сохраняется автоматически."));
+
+  const avg = Math.round(days.reduce((s, d) => s + d.k, 0) / days.length);
+  const inNorm = days.filter((d) => Math.abs(d.k - (d.target + d.burned)) <= d.target * 0.1).length;
+
+  return React.createElement("div", { style: ({ display: "flex", flexDirection: "column", gap: 10 }) },
+    React.createElement("div", { style: ({ display: "flex", gap: 8 }) },
+      [{ l: "Дней с записями", v: days.length }, { l: "Средние ккал", v: avg }, { l: "В норме", v: inNorm + " дн." }
+      ].map((x) => React.createElement("div", { key: (x.l), className: ("ch-card-soft"), style: ({ flex: 1, textAlign: "center", padding: "11px 5px" }) },
+        React.createElement("div", { style: ({ fontSize: 10, color: "var(--grey-500)", marginBottom: 4 }) }, x.l),
+        React.createElement("div", { className: ("mono"), style: ({ fontSize: 14, fontWeight: 700 }) }, x.v)))),
+    open ? React.createElement(DayDetail, { day: (open), onClose: (() => setOpen(null)) }) : null,
+    days.map((d) => {
+      const goal = d.target + (d.burned || 0);
+      const pct = Math.min(100, Math.round((d.k / Math.max(1, goal)) * 100));
+      const over = d.k > goal * 1.05;
+      return React.createElement("div", { key: (d.d), className: ("ch-card-soft"), style: ({ cursor: "pointer" }),
+          onClick: (() => setOpen(open && open.d === d.d ? null : d)) },
+        React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", marginBottom: 6 }) },
+          React.createElement("span", { style: ({ fontSize: 12.5, fontWeight: 600 }) },
+            (d.today ? "Сегодня · " : "") + ruDate(d.d) + " · " + DOW[new Date(d.d + "T12:00:00").getDay()]),
+          React.createElement("span", { className: ("mono"), style: ({ fontSize: 12, color: over ? "#fb7185" : "var(--green-400)" }) },
+            d.k + " / " + goal)),
+        React.createElement("div", { style: ({ height: 5, borderRadius: 5, background: "var(--bg-elev-2)", overflow: "hidden" }) },
+          React.createElement("div", { style: ({ height: "100%", width: pct + "%", background: over ? "#fb7185" : "var(--green-400)" }) })));
+    }));
+}
+
+/* ═══════════ Экран «Календарь» — месяц целиком ═══════════ */
+const MONTHS_RU = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
+
+function CalendarScreen() {
+  const st = useStore();
+  const now = new Date();
+  const [ym, setYm] = useState({ y: now.getFullYear(), m: now.getMonth() });
+  const [sel, setSel] = useState(null);
+
+  /* карта всех известных дней */
+  const map = {};
+  (st.history || []).forEach((h) => { map[h.d] = h; });
+  const e = eatenToday(st.diary);
+  const todayIso = isoDay(new Date());
+  map[todayIso] = { d: todayIso, k: Math.round(e.k), p: Math.round(e.p), f: Math.round(e.f), c: Math.round(e.c),
+    target: st.targets.kcal, burned: burnedToday(st.activity), water: st.water,
+    meals: (st.diary || []).map((x) => ({ n: x.n, k: x.k, t: x.t })), today: true };
+
+  const first = new Date(ym.y, ym.m, 1);
+  const daysInMonth = new Date(ym.y, ym.m + 1, 0).getDate();
+  const shift = (first.getDay() + 6) % 7;              // неделя с понедельника
+  const cells = [];
+  for (let i = 0; i < shift; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const iso = ym.y + "-" + String(ym.m + 1).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+    cells.push(map[iso] ? Object.assign({ day: d }, map[iso]) : { day: d, d: iso, empty: true, k: 0, target: st.targets.kcal, burned: 0 });
+  }
+
+  const shiftMonth = (n) => { const dt = new Date(ym.y, ym.m + n, 1); setYm({ y: dt.getFullYear(), m: dt.getMonth() }); setSel(null); };
+  const isFuture = (iso) => iso > todayIso;
+
+  /* сводка месяца */
+  const filled = cells.filter((c) => c && !c.empty && c.k > 0);
+  const avg = filled.length ? Math.round(filled.reduce((a, c) => a + c.k, 0) / filled.length) : 0;
+  const hit = filled.filter((c) => Math.abs(c.k - (c.target + c.burned)) <= c.target * 0.1).length;
+  const streak = (() => {
+    let n = 0;
+    for (let i = 0; i < 90; i++) {
+      const dt = new Date(); dt.setDate(dt.getDate() - i);
+      const h = map[isoDay(dt)];
+      if (h && h.k > 0) n++; else if (i > 0) break;
+    }
+    return n;
+  })();
+
+  return React.createElement("div", { className: ("ch-scroll") },
+    React.createElement("div", { className: ("ch-hero"), style: ({ marginTop: 10 }) },
+      React.createElement("div", { style: ({ display: "flex", alignItems: "center", gap: 12 }) },
+        React.createElement("div", { className: ("ch-hero-emoji") }, "🗓️"),
+        React.createElement("div", null,
+          React.createElement("div", { className: ("ch-eyebrow") }, "Календарь"),
+          React.createElement("div", { className: ("disp"), style: ({ fontSize: 19, fontWeight: 700 }) }, "История питания")))),
+
+    /* сводка */
+    React.createElement("div", { style: ({ display: "flex", gap: 8, marginBottom: 14 }) },
+      [{ l: "Дней подряд", v: streak }, { l: "Средние ккал", v: avg || "—" }, { l: "В норме", v: hit + " дн." }
+      ].map((x) => React.createElement("div", { key: (x.l), className: ("ch-card-soft"), style: ({ flex: 1, textAlign: "center", padding: "12px 5px" }) },
+        React.createElement("div", { style: ({ fontSize: 10, color: "var(--grey-500)", marginBottom: 4 }) }, x.l),
+        React.createElement("div", { className: ("mono"), style: ({ fontSize: 15, fontWeight: 700, color: "var(--green-400)" }) }, x.v)))),
+
+    /* переключение месяца */
+    React.createElement("div", { className: ("ch-card"), style: ({ marginBottom: 14 }) },
+      React.createElement("div", { style: ({ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }) },
+        React.createElement("div", { onClick: (() => shiftMonth(-1)), style: ({ cursor: "pointer", padding: 5 }) },
+          React.createElement(ChevronLeft, { size: (18), color: ("var(--green-400)") })),
+        React.createElement("span", { style: ({ fontSize: 14, fontWeight: 700 }) }, MONTHS_RU[ym.m] + " " + ym.y),
+        React.createElement("div", { onClick: (() => shiftMonth(1)), style: ({ cursor: "pointer", padding: 5,
+          opacity: (ym.y > now.getFullYear() || (ym.y === now.getFullYear() && ym.m >= now.getMonth())) ? 0.25 : 1 }) },
+          React.createElement(ChevronRight, { size: (18), color: ("var(--green-400)") }))),
+
+      React.createElement("div", { style: ({ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 7 }) },
+        ["пн","вт","ср","чт","пт","сб","вс"].map((d) => React.createElement("div", { key: (d), style: ({
+          textAlign: "center", fontSize: 9.5, color: "var(--grey-500)" }) }, d))),
+
+      React.createElement("div", { style: ({ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 }) },
+        cells.map((c, i) => {
+          if (!c) return React.createElement("div", { key: ("e" + i) });
+          const future = isFuture(c.d);
+          const goal = c.target + (c.burned || 0);
+          const pct = c.empty || !c.k ? 0 : Math.min(1, c.k / Math.max(1, goal));
+          const over = c.k > goal * 1.05;
+          const active = sel && sel.d === c.d;
+          const bg = future ? "transparent" : c.empty || !c.k ? "var(--bg-elev-2)"
+            : over ? "rgba(251,113,133,0.22)" : pct >= 0.8 ? "rgba(52,211,153,0.24)" : "rgba(167,139,250,0.2)";
+          const bd = active ? "var(--green-400)" : c.d === todayIso ? "var(--green-500)" : "transparent";
+          return React.createElement("div", { key: (c.d),
+            onClick: (() => { if (!future) setSel(active ? null : c); }),
+            style: ({ aspectRatio: "1", borderRadius: 10, background: bg, border: "1px solid " + bd,
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+              cursor: future ? "default" : "pointer", opacity: future ? 0.3 : 1 }) },
+            React.createElement("span", { className: ("mono"), style: ({ fontSize: 11.5,
+              fontWeight: c.d === todayIso ? 700 : 500,
+              color: c.d === todayIso ? "var(--green-400)" : "var(--grey-300)" }) }, c.day),
+            !c.empty && c.k ? React.createElement("span", { style: ({ width: 4, height: 4, borderRadius: "50%",
+              marginTop: 2, background: over ? "#fb7185" : pct >= 0.8 ? "var(--green-400)" : "#a78bfa" }) }) : null);
+        })),
+
+      React.createElement("div", { style: ({ display: "flex", gap: 12, justifyContent: "center", marginTop: 14, flexWrap: "wrap" }) },
+        [["var(--green-400)", "в норме"], ["#a78bfa", "недобор"], ["#fb7185", "перебор"]].map((x) =>
+          React.createElement("div", { key: (x[1]), style: ({ display: "flex", alignItems: "center", gap: 5 }) },
+            React.createElement("span", { style: ({ width: 6, height: 6, borderRadius: "50%", background: x[0] }) }),
+            React.createElement("span", { style: ({ fontSize: 10, color: "var(--grey-500)" }) }, x[1])))) ),
+
+    sel ? React.createElement(DayDetail, { day: (sel), onClose: (() => setSel(null)) }) : null,
+
+    React.createElement("div", { className: ("ch-h2"), style: ({ marginTop: 4, marginBottom: 10 }) }, "Последние дни"),
+    React.createElement(HistoryBlock, null));
+}
+
+/* ---------- микро-активность: реально начисляется ---------- */
+const MICRO_MOVES = [
+  { n: "Лестница вместо лифта", k: 18, m: 3, e: "🪜" },
+  { n: "Пешком одну остановку", k: 45, m: 12, e: "🚶" },
+  { n: "Разминка у стола", k: 22, m: 5, e: "🤸" },
+  { n: "Прогулка после еды", k: 60, m: 15, e: "🌳" },
+  { n: "Планка и приседания", k: 35, m: 6, e: "💪" },
+  { n: "Велосипед до магазина", k: 80, m: 15, e: "🚲" },
+];
+
+function MicroActivity() {
+  const st = useStore();
+  const [idx, setIdx] = useState(() => Math.floor(Math.random() * MICRO_MOVES.length));
+  const mv = MICRO_MOVES[idx];
+  const list = st.activity || [];
+  const burned = burnedToday(list);
+
+  const accept = () => {
+    CHStore.addActivity(mv.n, mv.k, mv.m);
+    setIdx((i) => (i + 1 + Math.floor(Math.random() * (MICRO_MOVES.length - 1))) % MICRO_MOVES.length);
+  };
+
+  return React.createElement("div", { style: ({ marginBottom: 10 }) },
+    React.createElement("div", { className: ("ch-card"), style: ({ display: "flex", gap: 12, alignItems: "center" }) },
+      React.createElement("div", { style: ({ width: 40, height: 40, borderRadius: 12, background: "rgba(244,114,182,0.16)",
+        display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }) }, mv.e),
+      React.createElement("div", { style: ({ flex: 1 }) },
+        React.createElement("div", { style: ({ fontWeight: 600, fontSize: 13 }) }, mv.n),
+        React.createElement("div", { style: ({ fontSize: 11.5, color: "var(--grey-500)", marginTop: 2 }) },
+          "Микро-активность · " + mv.m + " мин · +" + mv.k + " ккал")),
+      React.createElement("button", { className: ("ch-btn ch-btn-ghost"),
+        style: ({ padding: "8px 12px", fontSize: 11.5 }), onClick: (accept) }, "Принять")),
+
+    list.length ? React.createElement("div", { className: ("ch-card-soft"), style: ({ marginTop: 8 }) },
+      React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", marginBottom: 8 }) },
+        React.createElement("span", { style: ({ fontSize: 12, fontWeight: 600 }) }, "🔥 Движение за день"),
+        React.createElement("span", { className: ("mono"), style: ({ fontSize: 12, color: "var(--pink-400)" }) }, "+" + burned + " ккал")),
+      list.map((a) => React.createElement("div", { key: (a.id), style: ({ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }) },
+        React.createElement("span", { style: ({ flex: 1, fontSize: 11.5, color: "var(--grey-300)" }) }, a.n),
+        React.createElement("span", { className: ("mono"), style: ({ fontSize: 11, color: "var(--grey-500)" }) }, "+" + a.k),
+        React.createElement("span", { onClick: (() => CHStore.removeActivity(a.id)), style: ({ cursor: "pointer",
+          fontSize: 13, color: "var(--grey-600, #574d70)", padding: "0 3px" }) }, "✕")))) : null);
+}
+
+/* ---------- что Степан запомнил о вкусах ---------- */
+function TasteMemory() {
+  const st = useStore();
+  const t = st.tastes || { likes: [], dislikes: [] };
+  if (!t.likes.length && !t.dislikes.length) return null;
+  const pill = (w, bad) => React.createElement("div", { key: (w), className: ("ch-chip"),
+    style: ({ fontSize: 11, borderColor: bad ? "rgba(251,113,133,0.35)" : "rgba(52,211,153,0.35)",
+      color: bad ? "#fb7185" : "var(--green-400)" }),
+    onClick: (() => CHStore.forgetTaste(w)), title: ("Нажмите, чтобы забыть") },
+    (bad ? "✕ " : "♥ ") + w);
+  return React.createElement("div", { className: ("ch-card-soft"), style: ({ marginBottom: 4 }) },
+    React.createElement("div", { style: ({ fontSize: 12, fontWeight: 600, marginBottom: 8 }) }, "🌿 Степан запомнил"),
+    React.createElement("div", { style: ({ display: "flex", flexWrap: "wrap", gap: 6 }) },
+      t.likes.map((w) => pill(w, false)).concat(t.dislikes.map((w) => pill(w, true)))),
+    React.createElement("div", { style: ({ fontSize: 10, color: "var(--grey-600, #574d70)", marginTop: 8 }) },
+      "Нажмите на пункт, чтобы убрать"));
+}
+
+/* ---------- рацион на сегодня: живой, пересобираемый ---------- */
+function TodayPlan({ goto, compact }) {
+  const st = useStore();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [note, setNote] = useState("");
+  const [openId, setOpenId] = useState(null);
+
+  const meals = st.plan || [];
+
+  const build = async () => {
+    setBusy(true); setErr(""); setNote("");
+    try {
+      const r = await aiDayPlan({});
+      CHStore.setPlan(r.meals);
+      setNote(r.note || "");
+    } catch (e) { setErr(e.message || "Не получилось"); }
+    setBusy(false);
+  };
+
+  const list = compact ? meals.slice(0, 4) : meals;
+
+  return React.createElement(React.Fragment, null,
+    React.createElement("div", { style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, marginBottom: 8 }) },
+      React.createElement("div", { className: ("ch-h2"), style: ({ marginBottom: 0 }) }, "🍽️ Рацион на сегодня"),
+      meals.length && compact
+        ? React.createElement("div", { style: ({ fontSize: 12, color: "var(--green-400)", display: "flex", alignItems: "center", gap: 2, cursor: "pointer" }),
+            onClick: (() => goto && goto("plan")) }, "Все ", React.createElement(ChevronRight, { size: (14) }))
+        : null),
+
+    !meals.length && !busy && React.createElement("div", { className: ("ch-card"), style: ({ marginBottom: 12 }) },
+      React.createElement("div", { style: ({ fontSize: 13, fontWeight: 600, marginBottom: 6 }) }, "План на день ещё не собран"),
+      React.createElement("p", { className: ("ch-sub"), style: ({ marginBottom: 12 }) },
+        "Степан подберёт блюда под вашу норму, вкусы и цель. Каждый раз новые — повторов не будет."),
+      React.createElement("button", { className: ("ch-btn ch-btn-primary"), style: ({ width: "100%" }), onClick: (build) },
+        React.createElement(Sparkles, { size: (15) }), " Собрать рацион")),
+
+    busy && React.createElement("div", { className: ("ch-card"), style: ({ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }) },
+      React.createElement("div", { style: ({ width: 34, height: 34, borderRadius: 10, background: "var(--bg-elev-2)",
+        display: "flex", alignItems: "center", justifyContent: "center", animation: "chGlowPulse 1s ease-in-out infinite" }) },
+        React.createElement(Sparkles, { size: (15), color: ("var(--green-400)") })),
+      React.createElement("span", { style: ({ fontSize: 12.5, color: "var(--grey-300)" }) }, "Степан собирает рацион…")),
+
+    err && React.createElement("div", { className: ("ch-card-soft"), style: ({ marginBottom: 12, borderColor: "rgba(251,113,133,0.4)" }) },
+      React.createElement("span", { style: ({ fontSize: 12.5, color: "#fb7185" }) }, err)),
+
+    note && React.createElement("div", { className: ("ch-card-soft"), style: ({ marginBottom: 10, display: "flex", gap: 10 }) },
+      React.createElement("span", { style: ({ fontSize: 15 }) }, "🌿"),
+      React.createElement("span", { style: ({ fontSize: 12, color: "var(--grey-300)", lineHeight: 1.5 }) }, note)),
+
+    list.length ? React.createElement("div", { style: ({ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }) },
+      list.map((m) => React.createElement(React.Fragment, { key: (m.id) },
+        React.createElement(MealRow, { meal: (m), onOpen: (compact ? null : (() => setOpenId(openId === m.id ? null : m.id))) }),
+        !compact && openId === m.id && React.createElement("div", { className: ("ch-card-soft ch-scale-in"), style: ({ marginTop: -4 }) },
+          m.why ? React.createElement("div", { style: ({ fontSize: 11.5, color: "var(--green-400)", marginBottom: 10 }) }, m.why) : null,
+          m.ingredients ? React.createElement("div", { style: ({ marginBottom: 10 }) },
+            React.createElement("div", { style: ({ fontSize: 12, fontWeight: 600, marginBottom: 5 }) }, "Ингредиенты"),
+            m.ingredients.map((ing, i) => React.createElement("div", { key: (i), style: ({ fontSize: 11.5, color: "var(--grey-300)", marginBottom: 3 }) }, "· " + ing))) : null,
+          m.steps ? React.createElement("div", null,
+            React.createElement("div", { style: ({ fontSize: 12, fontWeight: 600, marginBottom: 5 }) }, "Приготовление"),
+            m.steps.map((stp, i) => React.createElement("div", { key: (i), style: ({ display: "flex", gap: 7, marginBottom: 5, fontSize: 11.5, color: "var(--grey-300)" }) },
+              React.createElement("span", { className: ("mono"), style: ({ color: "var(--green-400)", fontWeight: 700 }) }, (i + 1) + "."),
+              React.createElement("span", null, stp)))) : null)))) : null,
+
+    meals.length && !busy ? React.createElement("button", { className: ("ch-btn ch-btn-ghost"),
+      style: ({ width: "100%", fontSize: 12.5, marginBottom: 12 }), onClick: (build) },
+      React.createElement(Sparkles, { size: (14) }), " Собрать заново") : null);
 }
 
 const MEALS_TODAY = [
@@ -2410,8 +3126,7 @@ const MEALS_TODAY = [
   { id: 4, emoji: "🐟", name: "Лосось на пару, брокколи", time: "19:30", type: "Ужин", kcal: 480, p: 38, f: 22, c: 20, done: false },
 ];
 
-/* съеденное по плану сразу учитывается в дневнике — кольцо на главной живое */
-CHStore.seed(MEALS_TODAY.filter((m) => m.done));
+/* кольцо стартует с нуля: считаем только то, что человек реально отметил */
 
 /* Подбор блюд и продуктов под вкусовые предпочтения */
 const TASTE_WORDS = {
@@ -2541,7 +3256,7 @@ function PlanScreen({ goto, focus, profile }) {
     React.createElement("div", {className: ("ch-scroll")}, React.createElement("div", {className: ("ch-hero"), style: ({ marginTop: 10 })}, React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12 })}, React.createElement("div", {className: ("ch-hero-emoji")}, "🥗"), React.createElement("div", null, React.createElement("div", {className: ("ch-eyebrow")}, "Ваш план"), React.createElement("div", {className: ("disp"), style: ({ fontSize: 20, fontWeight: 700 })}, "Рацион на сегодня")))), React.createElement(FoundBanner, {title: (focus && focus.title)}), React.createElement("div", {style: ({ display: "flex", gap: 8, marginBottom: 16, overflowX: "auto" })}, tabs.map((t) => (
           React.createElement("div", {key: (t.id), className: (`ch-chip ${tab === t.id ? "active" : ""}`), style: ({ display: "flex", alignItems: "center", gap: 6 }), onClick: (() => setTab(t.id))}, React.createElement(t.Icon, {size: (13)}), t.label)
         ))), tab === "home" && (
-        React.createElement("div", {style: ({ display: "flex", flexDirection: "column", gap: 10 })}, React.createElement(TasteNote, {favFoods: (profile && profile.favFoods)}), React.createElement("div", {className: ("ch-sub"), style: ({ marginBottom: -2 })}, "Замените любой приём пищи на альтернативу."), byTaste(HOME_RECIPES, profile && profile.favFoods, (r) => r.name).map((item) => (
+        React.createElement("div", {style: ({ display: "flex", flexDirection: "column", gap: 10 })}, React.createElement(TodayPlan, {goto: (goto), compact: (false)}), React.createElement(TasteMemory, null), React.createElement(TasteNote, {favFoods: (profile && profile.favFoods)}), React.createElement("div", {className: ("ch-sub"), style: ({ marginBottom: -2 })}, "Или замените приём пищи готовым вариантом."), byTaste(HOME_RECIPES, profile && profile.favFoods, (r) => r.name).map((item) => (
             React.createElement("div", {key: (item.id), className: ("ch-card"), style: ({
               borderColor: focus && focus.title === item.name ? "var(--green-500)" : undefined,
             })}, React.createElement("div", {style: ({ display: "flex", gap: 12, alignItems: "flex-start" })}, React.createElement("div", {style: ({
@@ -3255,6 +3970,7 @@ function SearchScreen({ goto }) {
     ...FITNESS_SESSIONS.map((s) => ({ kind: "Тренировка", emoji: "📅", title: `${s.type} · ${s.club}`, sub: `${s.day}, ${s.time}`, screen: "community", color: "#a78bfa", focus: { title: s.club } })),
     ...PEOPLE.map((p) => ({ kind: "Люди", emoji: p.emoji, title: `${p.name}, ${p.age}`, sub: `${p.goal} · ${p.common}`, screen: "friends", color: "#fb7185", focus: { title: p.name } })),
     { kind: "Раздел", emoji: "🌿", title: "Степан · AI-помощник", sub: "Чат с наставником", screen: "ai", color: "#a78bfa" },
+    { kind: "Раздел", emoji: "🗓️", title: "Календарь питания", sub: "История по дням, месяц целиком", screen: "calendar", color: "#22d3ee" },
     { kind: "Раздел", emoji: "📈", title: "Мои результаты", sub: "Вес, мышцы, рабочие веса", screen: "results", color: "#34d399" },
     { kind: "Раздел", emoji: "🛒", title: "Корзина продуктов", sub: "Лавка, Пятёрочка, Самокат", screen: "cart", color: "#8b5cf6" },
     { kind: "Раздел", emoji: "📷", title: "Подсчёт калорий по фото", sub: "Камера и распознавание", screen: "home", color: "#fbbf24" },
@@ -3264,10 +3980,22 @@ function SearchScreen({ goto }) {
   const hasRecipe = !!findRecipe(query);
   const results = q ? index.filter((i) => i.title.toLowerCase().includes(q) || i.kind.toLowerCase().includes(q) || (i.sub || "").toLowerCase().includes(q)).slice(0, 12) : [];
 
-  const searchRecipe = () => {
+  const [rerr, setRerr] = useState("");
+  const searchRecipe = async () => {
     if (!q) return;
-    setLoading(true); setRecipe(null);
-    setTimeout(() => { setRecipe(findRecipe(query)); setLoading(false); }, 600);
+    setLoading(true); setRecipe(null); setRerr("");
+    const local = findRecipe(query);
+    if (local) { setTimeout(() => { setRecipe(local); setLoading(false); }, 400); return; }
+    try {
+      const r = await aiRecipe(query);
+      setRecipe({ name: r.name, kcal: r.kcal, p: r.p, f: r.f, c: r.c, time: r.time,
+        ingredients: r.ingredients, steps: r.steps, tip: r.tip, portions: r.portions, ai: true });
+    } catch (e) { setRerr(e.message || "Не удалось собрать рецепт."); }
+    setLoading(false);
+  };
+  const addRecipeToDiary = () => {
+    if (!recipe) return;
+    CHStore.addDiary({ n: recipe.name, k: recipe.kcal, p: recipe.p, f: recipe.f, c: recipe.c, src: "recipe" });
   };
 
   const SUGGEST = ["Протеин", "Смузи", "Приседания", "Вода", "Тренировка", "Гречка с курицей"];
@@ -3282,9 +4010,11 @@ function SearchScreen({ goto }) {
         React.createElement("div", {className: ("ch-scale-in"), style: ({ marginBottom: 16 })}, React.createElement("div", {className: ("ch-sub"), style: ({ marginBottom: 8, fontSize: 12 })}, "Найдено в приложении · ", results.length), React.createElement("div", {style: ({ display: "flex", flexDirection: "column", gap: 8 })}, results.map((r, i) => (
               React.createElement("div", {key: (i), className: ("ch-card-soft"), style: ({ display: "flex", alignItems: "center", gap: 12, cursor: "pointer" }), onClick: (() => goto(r.screen, r.focus))}, React.createElement("div", {className: ("ch-photo"), style: ({ width: 38, height: 38, background: `linear-gradient(135deg, ${r.color}, ${r.color}66)`, flexShrink: 0 })}, React.createElement("span", {className: ("ch-photo-inner"), style: ({ fontSize: 17 })}, r.emoji)), React.createElement("div", {style: ({ flex: 1, minWidth: 0 })}, React.createElement("div", {style: ({ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" })}, r.title), React.createElement("div", {style: ({ fontSize: 10.5, color: "var(--grey-500)", marginTop: 2 })}, r.sub)), React.createElement("span", {className: ("ch-tag"), style: ({ background: `${r.color}22`, color: r.color, flexShrink: 0 })}, r.kind))
             ))))
-      ), q && hasRecipe && (
+      ), q && q.length > 2 && (
         React.createElement("div", {style: ({ marginBottom: 16 })}, !recipe && !loading && (
-            React.createElement("button", {className: ("ch-btn ch-btn-ghost"), style: ({ width: "100%", fontSize: 12.5 }), onClick: (searchRecipe)}, "🍳 Показать рецепт «", findRecipe(query).name, "»")
+            React.createElement("button", {className: ("ch-btn ch-btn-ghost"), style: ({ width: "100%", fontSize: 12.5 }), onClick: (searchRecipe)}, hasRecipe ? "🍳 Показать рецепт «" + findRecipe(query).name + "»" : "🍳 Попросить Степана приготовить «" + query.trim() + "»")
+          ), rerr && !loading && (
+            React.createElement("div", {className: ("ch-card-soft"), style: ({ borderColor: "rgba(251,113,133,0.4)" })}, React.createElement("span", {style: ({ fontSize: 12.5, color: "#fb7185" })}, rerr))
           ), loading && (
             React.createElement("div", {style: ({ display: "flex", alignItems: "center", gap: 12, padding: "14px 2px" })}, React.createElement("div", {style: ({ width: 34, height: 34, borderRadius: 10, background: "var(--bg-elev-2)", display: "flex", alignItems: "center", justifyContent: "center", animation: "chGlowPulse 1s ease-in-out infinite" })}, React.createElement(Sparkles, {size: (15), color: ("var(--green-400)")})), React.createElement("span", {style: ({ fontSize: 12.5, color: "var(--grey-300)" })}, "AI подбирает рецепт..."))
           ), recipe && !loading && (
@@ -3292,7 +4022,7 @@ function SearchScreen({ goto }) {
                 React.createElement("div", {style: ({ marginBottom: 12 })}, React.createElement("div", {style: ({ fontSize: 12.5, fontWeight: 600, marginBottom: 6 })}, "Ингредиенты"), recipe.ingredients.map((ing, i) => (React.createElement("div", {key: (i), style: ({ fontSize: 12, color: "var(--grey-300)", marginBottom: 4 })}, "· ", ing))))
               ), React.createElement("div", {style: ({ fontSize: 12.5, fontWeight: 600, marginBottom: 6 })}, "Приготовление"), recipe.steps.map((s, i) => (
                 React.createElement("div", {key: (i), style: ({ display: "flex", gap: 8, marginBottom: 8, fontSize: 12, color: "var(--grey-300)" })}, React.createElement("span", {className: ("mono"), style: ({ color: "var(--green-400)", fontWeight: 700 })}, i + 1, "."), React.createElement("span", null, s))
-              )))
+              )), recipe.tip ? React.createElement("div", {style: ({ fontSize: 11.5, color: "var(--green-400)", marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border-soft)" })}, "💡 " + recipe.tip) : null, React.createElement("button", {className: ("ch-btn ch-btn-primary"), style: ({ width: "100%", marginTop: 12, fontSize: 12.5 }), onClick: (addRecipeToDiary)}, "+ Записать в дневник · " + recipe.kcal + " ккал"), recipe.ai ? React.createElement("div", {style: ({ fontSize: 10, color: "var(--grey-600, #574d70)", marginTop: 8, textAlign: "center" })}, "Рецепт собрал Степан" + (recipe.portions ? " · " + recipe.portions + " порц." : "") + " · калорийность оценочная") : null)
           ))
       ), q && results.length === 0 && !hasRecipe && !loading && (
         React.createElement("div", {className: ("ch-sub"), style: ({ textAlign: "center", padding: "14px 0" })}, "Ничего не найдено. Попробуйте другой запрос.")
@@ -3555,9 +4285,11 @@ function ResultsScreen({ profile }) {
           { l: "Жир", v: body.fat[body.fat.length - 1], u: " %", d: dF, inv: true },
         ].map((s) => (
           React.createElement("div", {key: (s.l), className: ("ch-card-soft"), style: ({ flex: 1, textAlign: "center", padding: "12px 6px" })}, React.createElement("div", {style: ({ fontSize: 10.5, color: "var(--grey-500)", marginBottom: 4 })}, s.l), React.createElement("div", {className: ("mono"), style: ({ fontSize: 15, fontWeight: 700, marginBottom: 3 })}, s.v, s.u), React.createElement(Delta, {value: (s.d), unit: (s.u.trim() === "%" ? "%" : ""), invert: (s.inv)}))
-        ))), React.createElement("div", {style: ({ display: "flex", gap: 6, marginBottom: 14 })}, [{ id: "body", label: "⚖️ Тело" }, { id: "lifts", label: "🏋️ Веса в зале" }].map((t) => (
+        ))), React.createElement("div", {style: ({ display: "flex", gap: 6, marginBottom: 14 })}, [{ id: "body", label: "⚖️ Тело" }, { id: "food", label: "🍽️ Питание" }, { id: "lifts", label: "🏋️ Зал" }].map((t) => (
           React.createElement("div", {key: (t.id), className: (`ch-chip ${tab === t.id ? "active" : ""}`), style: ({ flex: 1, textAlign: "center" }), onClick: (() => setTab(t.id))}, t.label)
-        ))), tab === "body" ? (
+        ))), tab === "food" ? (
+        React.createElement("div", {className: ("ch-scale-in")}, React.createElement("div", {className: ("ch-sub"), style: ({ marginBottom: 12 })}, "Каждый день сохраняется автоматически в полночь. Нажмите на день, чтобы посмотреть, что было съедено."), React.createElement(HistoryBlock, null))
+      ) : tab === "body" ? (
         React.createElement("div", {className: ("ch-scale-in"), style: ({ display: "flex", flexDirection: "column", gap: 12 })}, React.createElement("div", {className: ("ch-card")}, React.createElement("div", {style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 })}, React.createElement("span", {style: ({ fontSize: 13, fontWeight: 600 })}, "⚖️ Динамика веса"), React.createElement(Delta, {value: (dW), unit: (" кг"), invert: (goal === "lose")})), React.createElement(LineChart, {series: (body.weight), labels: (body.labels), color: ("#a78bfa"), unit: (" кг")})), React.createElement("div", {className: ("ch-card")}, React.createElement("div", {style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 })}, React.createElement("span", {style: ({ fontSize: 13, fontWeight: 600 })}, "💪 Мышечная масса"), React.createElement(Delta, {value: (dM), unit: (" кг")})), React.createElement(LineChart, {series: (body.muscle), labels: (body.labels), color: ("#34d399"), unit: (" кг")})), React.createElement("div", {className: ("ch-card")}, React.createElement("div", {style: ({ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 })}, React.createElement("span", {style: ({ fontSize: 13, fontWeight: 600 })}, "🔥 Процент жира"), React.createElement(Delta, {value: (dF), unit: ("%"), invert: (true)})), React.createElement(LineChart, {series: (body.fat), labels: (body.labels), color: ("#fb7185"), unit: ("%")})), React.createElement("button", {className: ("ch-btn ch-btn-primary"), style: ({ width: "100%" })}, React.createElement(Plus, {size: (15)}), " Записать новое измерение"))
       ) : (
         React.createElement("div", {className: ("ch-scale-in"), style: ({ display: "flex", flexDirection: "column", gap: 12 })}, React.createElement("div", {className: ("ch-sub"), style: ({ marginBottom: -2 })}, "Рабочие веса в базовых упражнениях — по последним записям тренировок."), LIFTS.map((l) => {
@@ -3574,6 +4306,7 @@ function ResultsScreen({ profile }) {
 /* ===================== ХАБ «ЕЩЁ» ===================== */
 function MoreScreen({ goto }) {
   const tiles = [
+    { id: "calendar", label: "Календарь питания", emoji: "🗓️", grad: "#34d399, #22d3ee" },
     { id: "results", label: "Мои результаты", emoji: "📈", grad: "#34d399, #8b5cf6" },
     { id: "cart", label: "Корзина", emoji: "🛒", grad: "#8b5cf6, #6d28d9" },
     { id: "community", label: "Сообщество", emoji: "👥", grad: "#38bdf8, #8b5cf6" },
@@ -3610,7 +4343,7 @@ function CrocusHealthApp() {
     React.createElement("div", {className: ("ch-root")}, React.createElement(GlobalStyle, null), React.createElement("div", {className: ("ch-phone")}, React.createElement("div", {className: ("ch-ambient-glow")}), React.createElement("div", {className: ("ch-notch")}), stage === "onboarding" ? (
           React.createElement(Onboarding, {onDone: ((p) => { setProfile(p); CHStore.setProfile(p); setStage("app"); })})
         ) : (
-          React.createElement(React.Fragment, null, screen === "home" && React.createElement(HomeScreen, {key: ("home"), profile: (profile), goto: (go)}), screen === "ai" && React.createElement(AIAssistantScreen, {key: ("ai"), profile: (profile), goto: (go)}), screen === "plan" && React.createElement(PlanScreen, {key: ("plan" + (focus ? focus.title : "")), goto: (go), focus: (focus), profile: (profile)}), screen === "search" && React.createElement(SearchScreen, {key: ("search"), goto: (go)}), screen === "cart" && React.createElement(CartScreen, {key: ("cart"), profile: (profile)}), screen === "community" && React.createElement(CommunityScreen, {key: ("community" + (focus ? focus.title : "")), goto: (go), focus: (focus)}), screen === "friends" && React.createElement(FriendsScreen, {key: ("friends" + (focus ? focus.title : "")), focus: (focus)}), screen === "gym" && React.createElement(GymScreen, {key: ("gym" + (focus ? focus.title : "")), focus: (focus)}), screen === "nutrition" && React.createElement(NutritionScreen, {key: ("nutrition" + (focus ? focus.title : "")), goBack: (() => go("more")), focus: (focus)}), screen === "water" && React.createElement(WaterScreen, {key: ("water" + (focus ? focus.title : "")), focus: (focus)}), screen === "cafe" && React.createElement(CafeScreen, {key: ("cafe" + (focus ? focus.title : "")), goBack: (() => go("more")), focus: (focus)}), screen === "results" && React.createElement(ResultsScreen, {key: ("results"), profile: (profile)}), screen === "more" && React.createElement(MoreScreen, {key: ("more"), goto: (go)}), React.createElement("div", {className: ("ch-navwrap")}, React.createElement("div", {className: ("ch-nav")}, NAV.map((n) => (
+          React.createElement(React.Fragment, null, screen === "home" && React.createElement(HomeScreen, {key: ("home"), profile: (profile), goto: (go)}), screen === "ai" && React.createElement(AIAssistantScreen, {key: ("ai"), profile: (profile), goto: (go)}), screen === "plan" && React.createElement(PlanScreen, {key: ("plan" + (focus ? focus.title : "")), goto: (go), focus: (focus), profile: (profile)}), screen === "search" && React.createElement(SearchScreen, {key: ("search"), goto: (go)}), screen === "cart" && React.createElement(CartScreen, {key: ("cart"), profile: (profile)}), screen === "community" && React.createElement(CommunityScreen, {key: ("community" + (focus ? focus.title : "")), goto: (go), focus: (focus)}), screen === "friends" && React.createElement(FriendsScreen, {key: ("friends" + (focus ? focus.title : "")), focus: (focus)}), screen === "gym" && React.createElement(GymScreen, {key: ("gym" + (focus ? focus.title : "")), focus: (focus)}), screen === "nutrition" && React.createElement(NutritionScreen, {key: ("nutrition" + (focus ? focus.title : "")), goBack: (() => go("more")), focus: (focus)}), screen === "water" && React.createElement(WaterScreen, {key: ("water" + (focus ? focus.title : "")), focus: (focus)}), screen === "cafe" && React.createElement(CafeScreen, {key: ("cafe" + (focus ? focus.title : "")), goBack: (() => go("more")), focus: (focus)}), screen === "calendar" && React.createElement(CalendarScreen, {key: ("calendar")}), screen === "results" && React.createElement(ResultsScreen, {key: ("results"), profile: (profile)}), screen === "more" && React.createElement(MoreScreen, {key: ("more"), goto: (go)}), React.createElement("div", {className: ("ch-navwrap")}, React.createElement("div", {className: ("ch-nav")}, NAV.map((n) => (
                   React.createElement("div", {key: (n.id), className: (`ch-nav-item ${screen === n.id ? "active" : ""}`), onClick: (() => go(n.id))}, React.createElement(n.Icon, {size: (18), className: ("ch-nav-ic")}), React.createElement("span", null, n.label))
                 )))))
         )))
